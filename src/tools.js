@@ -87,15 +87,63 @@ const KNOWN_BINARY_EXTENSIONS = new Set([
  * outside of this list is rejected by the binary safeguard.
  */
 const ALLOWED_TEXT_EXTENSIONS = new Set([
+  // JavaScript / TypeScript
   '.js', '.mjs', '.cjs', '.jsx',
   '.ts', '.tsx',
+  // Data / config
   '.json', '.jsonc',
+  '.yml', '.yaml',
+  '.toml', '.ini', '.cfg',
+  '.env',
+  '.xml', '.svg', '.csv',
+  // Markup / docs
   '.md', '.markdown',
   '.html', '.htm',
+  '.txt', '.rst', '.adoc',
+  // Stylesheets
   '.css', '.scss', '.sass', '.less',
-  '.yml', '.yaml',
-  '.txt', '.xml', '.svg', '.csv',
-  '.env', '.sh', '.toml', '.ini', '.cfg',
+  // Shell
+  '.sh', '.bash', '.zsh', '.fish', '.bat', '.cmd', '.ps1',
+  // Python
+  '.py', '.pyi', '.pyw',
+  // Ruby
+  '.rb', '.rake', '.gemspec',
+  // Rust
+  '.rs',
+  // Go
+  '.go',
+  // Java / Kotlin / Scala
+  '.java', '.kt', '.kts', '.scala',
+  // C / C++
+  '.c', '.h', '.cpp', '.cxx', '.cc', '.hpp', '.hxx',
+  // C#
+  '.cs',
+  // Swift / Objective-C
+  '.swift', '.m',
+  // PHP
+  '.php',
+  // Perl
+  '.pl', '.pm',
+  // Lua
+  '.lua',
+  // R
+  '.r', '.R',
+  // SQL
+  '.sql',
+  // Dart
+  '.dart',
+  // Elixir / Erlang
+  '.ex', '.exs', '.erl',
+  // Haskell
+  '.hs',
+  // Zig / Nim / V
+  '.zig', '.nim', '.v',
+  // Misc text
+  '.log', '.diff', '.patch',
+  '.dockerfile',
+  '.tf', '.hcl',
+  '.graphql', '.gql',
+  '.proto',
 ]);
 
 /**
