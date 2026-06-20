@@ -9,7 +9,7 @@
   "main": "./src/cli.js",
   "scripts": {
     "start": "node ./src/cli.js",
-    "lint": "node --check ./src/cli.js && node --check ./src/agent.js && node --check ./src/tools.js"
+    "lint": "node --check ./src/cli.js && node --check ./src/agent.js && node --check ./src/tools.js && node --check ./src/llamaServer.js"
   },
   "keywords": [
     "ai",

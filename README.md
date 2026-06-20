@@ -12,14 +12,32 @@ Thought -> Tool Selection -> Safety Check -> Execution -> Observation
 ## Requirements
 
 - Node.js **v20 or higher**
-- A running `llama.cpp` server with the OpenAI-compatible endpoint enabled, e.g.:
+- A `llama.cpp` server binary on your `PATH` (`llama-server`, `llama-cpp-server`
+  or the legacy `server`). The agent can **start this for you automatically** on
+  launch — see below. If you prefer to run it yourself:
 
   ```bash
-  ./server -m ./models/your-model.gguf -c 8192 --port 8080
+  llama-server -m ./models/your-model.gguf -c 8192 --port 8080
   ```
 
   The agent talks to `http://localhost:8080/v1/chat/completions` by default
   (override with the `LLAMA_ENDPOINT` environment variable).
+
+## Automatic server start & model selection
+
+When you launch `npm-agent`, after choosing your session and context window it
+will:
+
+1. Check whether a llama.cpp server is already running on the endpoint and, if
+   so, reuse it.
+2. Otherwise offer to **start one automatically**. It locates the server binary
+   (or `LLAMA_SERVER_BIN`), then asks **where your `.gguf` models live**,
+   recursively scans that directory and lets you pick the model to load.
+3. Spawn `llama-server -m <model> -c <contextWindow> --host 127.0.0.1 --port 8080`
+   and wait until its HTTP API reports healthy before the agent loop begins.
+
+The server we start is shut down automatically when you `/exit` or Ctrl+C. You
+can always pick *“Skip auto-start”* to manage the server yourself.
 
 ## Installation
 
@@ -79,6 +97,13 @@ with `/save`, and quit with `/exit`.
 | --- | --- | --- |
 | `LLAMA_ENDPOINT` | Chat-completions endpoint | `http://localhost:8080/v1/chat/completions` |
 | `LLAMA_MODEL` | Model name advertised to the server | `local-model` |
+| `LLAMA_SERVER_BIN` | Path/name of the llama.cpp server binary | auto-detected |
+| `LLAMA_MODELS_DIR` | Default directory shown when picking a model | auto-detected |
+| `LLAMA_PORT` | Port the auto-started server listens on | `8080` |
+| `LLAMA_HOST` | Host the auto-started server binds to | `127.0.0.1` |
+| `LLAMA_AUTO_START` | Set to `0`/`false` to default the auto-start prompt to “no” | `1` |
+| `LLAMA_SERVER_EXTRA_ARGS` | Extra flags appended to the server (e.g. `-ngl 99`) | _(none)_ |
+| `LLAMA_HEALTH_TIMEOUT_MS` | Max wait for the server to become healthy | `180000` |
 | `SERPAPI_KEY` | API key for `webSearch` | _(none)_ |
 
 ## License

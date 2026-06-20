@@ -33,6 +33,7 @@ import {
   createTokenAccumulator,
   resolveConfig,
 } from './agent.js';
+import { prepareLlamaServer } from './llamaServer.js';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -55,6 +56,8 @@ const appState = {
   sessionFilePath: null,
   /** @type {boolean} Whether the session has already been saved this run. */
   saved: false,
+  /** @type {{stop: () => void}|null} Handle to a llama.cpp server we started. */
+  serverHandle: null,
 };
 
 // ---------------------------------------------------------------------------
@@ -270,7 +273,13 @@ async function main() {
   appState.messages = messages;
   appState.sessionFilePath = sessionFilePath;
 
-  const config = resolveConfig({ contextWindow });
+  // Auto-start a local llama.cpp server (and let the user pick where their
+  // models live) before the agent loop begins. Falls back to the default
+  // endpoint if the user skips or no server can be started.
+  const { endpoint, handle } = await prepareLlamaServer({ contextWindow });
+  appState.serverHandle = handle;
+
+  const config = resolveConfig({ contextWindow, endpoint });
   const tokens = createTokenAccumulator();
 
   console.log(
@@ -291,6 +300,7 @@ async function main() {
       console.error(chalk.red.bold(`\n[FATAL] ${err.message}`));
       console.log(chalk.yellow('Saving session before exiting due to the error above…'));
       await persistOnce(true);
+      stopServer();
       process.exitCode = 1;
       return;
     }
@@ -345,6 +355,9 @@ async function main() {
       advanceModel = true;
     }
   }
+
+  // Normal exit (task complete or /exit): tear down any server we started.
+  stopServer();
 }
 
 /**
@@ -365,6 +378,18 @@ async function persistOnce(force = false) {
   }
 }
 
+/**
+ * Terminate any llama.cpp server this process started so it doesn't outlive the
+ * CLI. No-op when the server was externally managed / reused.
+ */
+function stopServer() {
+  if (appState.serverHandle && typeof appState.serverHandle.stop === 'function') {
+    console.log(chalk.dim('Shutting down the llama.cpp server we started…'));
+    appState.serverHandle.stop();
+    appState.serverHandle = null;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Clean-exit signal handling
 // ---------------------------------------------------------------------------
@@ -380,6 +405,7 @@ function installSignalHandlers() {
     if (appState.sessionFilePath) {
       console.log(chalk.greenBright(`Session saved to ${appState.sessionFilePath}.`));
     }
+    stopServer();
     process.exit(0);
   };
 
