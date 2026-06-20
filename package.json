@@ -1,0 +1,35 @@
+{
+  "name": "npm-agent",
+  "version": "1.0.0",
+  "description": "An autonomous AI Agent CLI tool for NPM development, integrating with a local llama.cpp OpenAI-compatible server via native function calling.",
+  "type": "module",
+  "bin": {
+    "npm-agent": "./src/cli.js"
+  },
+  "main": "./src/cli.js",
+  "scripts": {
+    "start": "node ./src/cli.js",
+    "lint": "node --check ./src/cli.js && node --check ./src/agent.js && node --check ./src/tools.js"
+  },
+  "keywords": [
+    "ai",
+    "agent",
+    "cli",
+    "llama.cpp",
+    "llm",
+    "function-calling",
+    "autonomous",
+    "npm"
+  ],
+  "author": "",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "dependencies": {
+    "chalk": "^5.3.0",
+    "inquirer": "^9.3.7",
+    "node-fetch": "^3.3.2",
+    "ora": "^8.1.0"
+  }
+}
