@@ -290,49 +290,60 @@ async function main() {
     } catch (err) {
       console.error(chalk.red.bold(`\n[FATAL] ${err.message}`));
       console.log(chalk.yellow('Saving session before exiting due to the error above…'));
-      await persistOnce();
+      await persistOnce(true);
       process.exitCode = 1;
       return;
     }
 
     if (result.status === 'complete') {
       // Persistence trigger: task fully accomplished.
-      await persistOnce();
-      console.log(chalk.greenBright(`\nSession saved to ${sessionFilePath}. Goodbye!`));
-      running = false;
-      break;
-    }
-
-    // status === 'awaiting_user': prompt for the next instruction.
-    const { nextInput } = await inquirer.prompt([
-      {
-        type: 'input',
-        name: 'nextInput',
-        message: chalk.whiteBright('Your reply (type /exit to quit, /save to persist now):'),
-      },
-    ]);
-
-    const trimmed = (nextInput || '').trim();
-
-    if (trimmed === '/exit' || trimmed === '/quit') {
-      await persistOnce();
-      console.log(chalk.greenBright(`\nSession saved to ${sessionFilePath}. Goodbye!`));
-      running = false;
-      break;
-    }
-
-    if (trimmed === '/save') {
       await persistOnce(true);
-      console.log(chalk.green(`Session manually saved to ${sessionFilePath}.`));
-      continue; // re-prompt without advancing the model
+      console.log(chalk.greenBright(`\nSession saved to ${sessionFilePath}. Goodbye!`));
+      running = false;
+      break;
     }
 
-    if (trimmed.length === 0) {
-      console.log(chalk.dim('(empty input ignored — type a message, /save or /exit)'));
-      continue;
-    }
+    // status === 'awaiting_user': prompt for the next instruction. This inner
+    // loop keeps re-prompting the human (without re-invoking the model) until a
+    // real message is entered or an exit is requested. Non-message commands
+    // such as /save and empty input fall through to another prompt rather than
+    // triggering a wasteful extra LLM round-trip.
+    let advanceModel = false;
+    while (!advanceModel && running) {
+      const { nextInput } = await inquirer.prompt([
+        {
+          type: 'input',
+          name: 'nextInput',
+          message: chalk.whiteBright('Your reply (type /exit to quit, /save to persist now):'),
+        },
+      ]);
 
-    messages.push({ role: 'user', content: trimmed });
+      const trimmed = (nextInput || '').trim();
+
+      if (trimmed === '/exit' || trimmed === '/quit') {
+        await persistOnce(true);
+        console.log(chalk.greenBright(`\nSession saved to ${sessionFilePath}. Goodbye!`));
+        running = false;
+        break;
+      }
+
+      if (trimmed === '/save') {
+        await persistOnce(true);
+        console.log(chalk.green(`Session manually saved to ${sessionFilePath}.`));
+        continue; // re-prompt the user without advancing the model
+      }
+
+      if (trimmed.length === 0) {
+        console.log(chalk.dim('(empty input ignored — type a message, /save or /exit)'));
+        continue; // re-prompt the user without advancing the model
+      }
+
+      // A real instruction was provided: record it and let the outer loop run
+      // the next model turn. New content invalidates any prior save.
+      messages.push({ role: 'user', content: trimmed });
+      appState.saved = false;
+      advanceModel = true;
+    }
   }
 }
 
