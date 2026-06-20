@@ -27,7 +27,7 @@ import chalk from 'chalk';
 import ora from 'ora';
 import fetch from 'node-fetch';
 
-import { toolSchemas, dispatchTool } from './tools.js';
+import { toolSchemas, dispatchTool, writeFile } from './tools.js';
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -58,6 +58,172 @@ export const COMPLETION_MARKER = 'TASK_COMPLETE';
  * turn. Prevents runaway loops if the model keeps calling tools indefinitely.
  */
 const MAX_ITERATIONS_PER_TURN = 50;
+
+// ---------------------------------------------------------------------------
+// Auto-write interceptor — code-block extraction + filename inference
+// ---------------------------------------------------------------------------
+
+/**
+ * Language hint (from a fenced code block) → file extension mapping.
+ * Used as a fallback when the surrounding text contains no filename.
+ */
+const LANG_EXT_MAP = new Map([
+  ['python', '.py'], ['py', '.py'],
+  ['javascript', '.js'], ['js', '.js'], ['jsx', '.jsx'],
+  ['typescript', '.ts'], ['ts', '.ts'], ['tsx', '.tsx'],
+  ['html', '.html'], ['htm', '.html'],
+  ['css', '.css'], ['scss', '.scss'], ['sass', '.sass'], ['less', '.less'],
+  ['json', '.json'], ['jsonc', '.json'],
+  ['yaml', '.yaml'], ['yml', '.yaml'],
+  ['bash', '.sh'], ['sh', '.sh'], ['shell', '.sh'], ['zsh', '.sh'],
+  ['markdown', '.md'], ['md', '.md'],
+  ['xml', '.xml'], ['svg', '.svg'],
+  ['sql', '.sql'],
+  ['ruby', '.rb'], ['rb', '.rb'],
+  ['rust', '.rs'], ['rs', '.rs'],
+  ['go', '.go'],
+  ['java', '.java'],
+  ['c', '.c'], ['cpp', '.cpp'], ['cxx', '.cpp'],
+  ['toml', '.toml'],
+  ['ini', '.ini'],
+  ['txt', '.txt'],
+  ['csv', '.csv'],
+  ['env', '.env'],
+  ['cfg', '.cfg'],
+]);
+
+/**
+ * Allowed file extensions for auto-write (text-based formats only).
+ * Must stay in sync with the text-extension allowlist in tools.js.
+ */
+const AUTOWRITE_EXTS = new Set([
+  '.py', '.js', '.mjs', '.cjs', '.jsx', '.ts', '.tsx',
+  '.html', '.htm', '.css', '.scss', '.sass', '.less',
+  '.json', '.jsonc', '.yaml', '.yml',
+  '.sh', '.md', '.markdown', '.xml', '.svg', '.sql',
+  '.rb', '.rs', '.go', '.java', '.c', '.cpp', '.cxx',
+  '.toml', '.ini', '.txt', '.csv', '.env', '.cfg',
+]);
+
+/** Language hints that typically represent terminal commands, not file content. */
+const SHELL_LANGS = new Set(['sh', 'bash', 'shell', 'zsh', 'cmd', 'powershell', 'bat', 'ps1', 'console', 'terminal']);
+
+/**
+ * Try to find a plausible filename inside a text fragment by looking for
+ * backtick-quoted or double-quoted paths with known text-file extensions.
+ *
+ * @param {string} text - The text to search.
+ * @returns {string|null} The best candidate filename, or null.
+ */
+function findFilenameInText(text) {
+  // Backtick-quoted filenames (strongest signal).
+  const backtickRe = /`([a-zA-Z0-9_\-./]+\.[a-zA-Z0-9]{1,8})`/g;
+  const candidates = [];
+  let m;
+  while ((m = backtickRe.exec(text)) !== null) {
+    const ext = '.' + m[1].split('.').pop().toLowerCase();
+    if (AUTOWRITE_EXTS.has(ext)) candidates.push(m[1]);
+  }
+  if (candidates.length > 0) return candidates[candidates.length - 1];
+
+  // Double-quoted filenames.
+  const quotedRe = /"([a-zA-Z0-9_\-./]+\.[a-zA-Z0-9]{1,8})"/g;
+  while ((m = quotedRe.exec(text)) !== null) {
+    const ext = '.' + m[1].split('.').pop().toLowerCase();
+    if (AUTOWRITE_EXTS.has(ext)) candidates.push(m[1]);
+  }
+  if (candidates.length > 0) return candidates[candidates.length - 1];
+
+  // Bare filenames preceded by common phrases.
+  const phraseRe = /(?:named|called|save (?:it )?(?:as|to)|file\s+)\s*[`"']?([a-zA-Z0-9_\-./]+\.[a-zA-Z0-9]{1,8})[`"']?/gi;
+  while ((m = phraseRe.exec(text)) !== null) {
+    const ext = '.' + m[1].split('.').pop().toLowerCase();
+    if (AUTOWRITE_EXTS.has(ext)) return m[1];
+  }
+
+  return null;
+}
+
+/**
+ * Detect whether a code block looks like a terminal command rather than file
+ * content. Terminal commands typically start with common CLI tool names.
+ *
+ * @param {string} code - The code block body.
+ * @returns {boolean}
+ */
+function looksLikeCommand(code) {
+  const first = code.trim().split('\n')[0].replace(/^\$\s*/, '').trim();
+  return /^(python|python3|node|npm|npx|pip|cd|ls|cat|echo|mkdir|git|curl|wget|.\/)/.test(first);
+}
+
+/**
+ * Parse the assistant's plain-text response for fenced code blocks and
+ * surrounding filename hints. Returns a list of files that should be
+ * auto-written to disk.
+ *
+ * @param {string} content - The full assistant message text.
+ * @returns {Array<{filePath: string, code: string}>}
+ */
+export function extractFileWrites(content) {
+  const results = [];
+  const codeBlockRe = /```(\w*)\n([\s\S]*?)```/g;
+  const blocks = [];
+  let match;
+  while ((match = codeBlockRe.exec(content)) !== null) {
+    blocks.push({
+      lang: (match[1] || '').toLowerCase(),
+      code: match[2],
+      start: match.index,
+      end: match.index + match[0].length,
+    });
+  }
+  if (blocks.length === 0) return results;
+
+  const usedPaths = new Set();
+
+  for (let i = 0; i < blocks.length; i++) {
+    const block = blocks[i];
+
+    // Skip shell / command blocks.
+    if (SHELL_LANGS.has(block.lang) || looksLikeCommand(block.code)) continue;
+
+    // Skip trivially short snippets.
+    if (block.code.trim().length < 10) continue;
+
+    // --- Filename resolution -------------------------------------------------
+    // Look at the text segment between the previous block (or start) and this
+    // block, then fall back to the segment after this block.
+    const segBefore = content.slice(i === 0 ? 0 : blocks[i - 1].end, block.start);
+    const segAfter = content.slice(
+      block.end,
+      i < blocks.length - 1 ? blocks[i + 1].start : content.length,
+    );
+
+    let filePath = findFilenameInText(segBefore) || findFilenameInText(segAfter);
+
+    // Fallback: generate a default name from the language hint.
+    if (!filePath && block.lang) {
+      const ext = LANG_EXT_MAP.get(block.lang);
+      if (ext) {
+        // Use a descriptive default; append a counter if collisions arise.
+        const base = `output${ext}`;
+        filePath = usedPaths.has(base) ? `output_${i}${ext}` : base;
+      }
+    }
+
+    if (!filePath) continue;
+    if (usedPaths.has(filePath)) {
+      // Disambiguate duplicate targets.
+      const ext = '.' + filePath.split('.').pop();
+      const stem = filePath.slice(0, filePath.length - ext.length);
+      filePath = `${stem}_${i}${ext}`;
+    }
+    usedPaths.add(filePath);
+    results.push({ filePath, code: block.code });
+  }
+
+  return results;
+}
 
 // ---------------------------------------------------------------------------
 // System prompt
@@ -324,6 +490,44 @@ export async function runTurn(messages, config, cumulative) {
         const summary = content.slice(COMPLETION_MARKER.length).trim();
         console.log(chalk.greenBright.bold('\n[TASK COMPLETE] ') + chalk.green(summary || '(no summary provided)'));
         return { status: 'complete', content: summary };
+      }
+
+      // --- Auto-write interceptor -------------------------------------------
+      // Many local models fail to use function-calling and instead output code
+      // blocks as plain text.  Detect these, write them to disk automatically,
+      // and re-enter the loop so the model sees the files were created.
+      const pendingWrites = extractFileWrites(content);
+      if (pendingWrites.length > 0) {
+        const written = [];
+        for (const { filePath, code } of pendingWrites) {
+          logAction('writeFile (auto)', { filePath });
+          try {
+            const obs = await writeFile(filePath, code);
+            logObservation(obs);
+            written.push(filePath);
+          } catch (err) {
+            logObservation(`Auto-write failed for "${filePath}": ${err.message}`);
+          }
+        }
+
+        if (written.length > 0) {
+          console.log(
+            chalk.blueBright(
+              `\n[AUTO-WRITE] Wrote ${written.length} file(s) to disk: ${written.join(', ')}`,
+            ),
+          );
+
+          // Inject a synthetic user message so the model sees the result and can
+          // verify / continue / emit TASK_COMPLETE on the next iteration.
+          messages.push({
+            role: 'user',
+            content:
+              `[System] The following files were automatically written to disk based on your response:\n` +
+              written.map((f) => `  - ${f}`).join('\n') +
+              `\nPlease verify them (e.g. readFile / executeCommand) and then complete the task.`,
+          });
+          continue; // re-enter the agent loop
+        }
       }
 
       // Otherwise the model is talking to the user (question / status).
