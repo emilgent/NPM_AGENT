@@ -301,15 +301,16 @@ function normalizeInputPath(value) {
 }
 
 /**
- * Validate a user-entered GGUF file path.
+ * Validate a user-entered GGUF file path. Returns a message string on error,
+ * or undefined when valid (the shape `@clack/prompts` expects).
  * @param {string} value
  * @param {boolean} allowEmpty
- * @returns {true|string}
+ * @returns {string|undefined}
  */
 function validateGgufPath(value, allowEmpty = false) {
   const trimmed = value.trim();
   if (!trimmed) {
-    return allowEmpty ? true : 'Please enter a path.';
+    return allowEmpty ? undefined : 'Please enter a path.';
   }
 
   const resolved = normalizeInputPath(trimmed);
@@ -330,19 +331,20 @@ function validateGgufPath(value, allowEmpty = false) {
     return `File not found: ${resolved}`;
   }
 
-  return true;
+  return undefined;
 }
 
 /**
- * Validate a user-entered binary path.
+ * Validate a user-entered binary path. Returns a message string on error,
+ * or undefined when valid (the shape `@clack/prompts` expects).
  * @param {string} value
  * @param {boolean} allowEmpty
- * @returns {true|string}
+ * @returns {string|undefined}
  */
 function validateBinaryPath(value, allowEmpty = false) {
   const trimmed = value.trim();
   if (!trimmed) {
-    return allowEmpty ? true : 'Please enter a path.';
+    return allowEmpty ? undefined : 'Please enter a path.';
   }
 
   const resolved = normalizeInputPath(trimmed);
@@ -359,7 +361,7 @@ function validateBinaryPath(value, allowEmpty = false) {
     return `File not found: ${resolved}`;
   }
 
-  return true;
+  return undefined;
 }
 
 /**
