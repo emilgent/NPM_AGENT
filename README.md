@@ -30,10 +30,13 @@ will:
 
 1. Check whether a llama.cpp server is already running on the endpoint and, if
    so, reuse it.
-2. Otherwise offer to **start one automatically**. It locates the server binary
-   (or `LLAMA_SERVER_BIN`), then asks **where your `.gguf` models live**,
-   recursively scans that directory and lets you pick the model to load.
-3. Spawn `llama-server -m <model> -c <contextWindow> --host 127.0.0.1 --port 8080`
+2. Otherwise open a preset picker for **Llama 3**, **Phi-3**, or **Custom path…**
+   and scan the usual model directories for matching `.gguf` files. If no
+   match is found, it falls back to a manual path prompt.
+3. Resolve the server binary from `LLAMA_SERVER_BIN`, PATH, or common install
+   locations; if none are found, you can enter the binary path manually or skip
+   auto-start.
+4. Spawn `llama-server -m <model> -c <contextWindow> --host 127.0.0.1 --port 8080`
    and wait until its HTTP API reports healthy before the agent loop begins.
 
 The server we start is shut down automatically when you `/exit` or Ctrl+C. You
