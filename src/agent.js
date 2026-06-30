@@ -27,7 +27,10 @@ import chalk from 'chalk';
 import ora from 'ora';
 import fetch from 'node-fetch';
 
-import { toolSchemas, dispatchTool, writeFile } from './tools.js';
+import { toolSchemas, dispatchTool, writeFile, toolImplementations } from './tools.js';
+
+/** Known tool names, used to detect text-format tool calls. */
+const KNOWN_TOOL_NAMES = new Set(Object.keys(toolImplementations));
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -108,6 +111,74 @@ const AUTOWRITE_EXTS = new Set([
 /** Language hints that typically represent terminal commands, not file content. */
 const SHELL_LANGS = new Set(['sh', 'bash', 'shell', 'zsh', 'cmd', 'powershell', 'bat', 'ps1', 'console', 'terminal']);
 
+// ---------------------------------------------------------------------------
+// Text-format tool call interceptor
+// ---------------------------------------------------------------------------
+
+/**
+ * Many small / local models do not use the native function-calling protocol.
+ * Instead they output a fenced JSON block such as:
+ *
+ *   ```json
+ *   { "name": "writeFile", "arguments": { "filePath": "hello.py", ... } }
+ *   ```
+ *
+ * This function detects those blocks and returns them as structured tool calls
+ * so the agent loop can dispatch them through the normal `dispatchTool` path.
+ *
+ * @param {string} content - The full assistant message text.
+ * @returns {Array<{name: string, args: object}>}
+ */
+export function extractTextToolCalls(content) {
+  const codeBlockRe = /```(?:json)?\n([\s\S]*?)```/g;
+  const calls = [];
+  let match;
+  while ((match = codeBlockRe.exec(content)) !== null) {
+    const raw = match[1].trim();
+    let parsed;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      continue;
+    }
+    if (
+      parsed &&
+      typeof parsed === 'object' &&
+      typeof parsed.name === 'string' &&
+      KNOWN_TOOL_NAMES.has(parsed.name) &&
+      parsed.arguments !== undefined &&
+      typeof parsed.arguments === 'object'
+    ) {
+      calls.push({ name: parsed.name, args: parsed.arguments });
+    }
+  }
+  return calls;
+}
+
+/**
+ * Check whether a code block body is a JSON-format tool call that will be
+ * handled by `extractTextToolCalls` instead of auto-write.
+ *
+ * @param {string} code - The code block body.
+ * @param {string} lang - The fenced language hint.
+ * @returns {boolean}
+ */
+function isTextToolCall(code, lang) {
+  if (lang !== '' && lang !== 'json' && lang !== 'jsonc') return false;
+  try {
+    const parsed = JSON.parse(code.trim());
+    return (
+      parsed &&
+      typeof parsed === 'object' &&
+      typeof parsed.name === 'string' &&
+      KNOWN_TOOL_NAMES.has(parsed.name) &&
+      parsed.arguments !== undefined
+    );
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Try to find a plausible filename inside a text fragment by looking for
  * backtick-quoted or double-quoted paths with known text-file extensions.
@@ -186,6 +257,9 @@ export function extractFileWrites(content) {
 
     // Skip shell / command blocks.
     if (SHELL_LANGS.has(block.lang) || looksLikeCommand(block.code)) continue;
+
+    // Skip JSON blocks that are text-format tool calls (handled separately).
+    if (isTextToolCall(block.code, block.lang)) continue;
 
     // Skip trivially short snippets.
     if (block.code.trim().length < 10) continue;
@@ -490,6 +564,43 @@ export async function runTurn(messages, config, cumulative) {
         const summary = content.slice(COMPLETION_MARKER.length).trim();
         console.log(chalk.greenBright.bold('\n[TASK COMPLETE] ') + chalk.green(summary || '(no summary provided)'));
         return { status: 'complete', content: summary };
+      }
+
+      // --- Text-format tool call interceptor --------------------------------
+      // Some local models output tool invocations as ```json {"name":"writeFile",
+      // "arguments":{...}} ``` instead of using the native function-calling
+      // protocol.  Detect these, dispatch them through the normal tool pipeline,
+      // and feed the results back to the model.
+      const textCalls = extractTextToolCalls(content);
+      if (textCalls.length > 0) {
+        const resultLines = [];
+        for (const { name, args } of textCalls) {
+          logAction(name, args);
+          let observation;
+          try {
+            observation = await dispatchTool(name, args);
+          } catch (err) {
+            observation = `Error while executing tool "${name}": ${err && err.message ? err.message : String(err)}`;
+          }
+          logObservation(observation);
+          const obsStr = typeof observation === 'string' ? observation : JSON.stringify(observation);
+          resultLines.push(`[${name}] ${obsStr}`);
+        }
+
+        console.log(
+          chalk.blueBright(
+            `\n[TEXT-TOOL-CALL] Executed ${textCalls.length} tool call(s) from model text output.`,
+          ),
+        );
+
+        messages.push({
+          role: 'user',
+          content:
+            `[System] Your tool calls were executed successfully. Results:\n\n` +
+            resultLines.join('\n\n') +
+            `\n\nContinue with the task. When fully done, reply with TASK_COMPLETE followed by a summary.`,
+        });
+        continue; // re-enter the agent loop
       }
 
       // --- Auto-write interceptor -------------------------------------------
