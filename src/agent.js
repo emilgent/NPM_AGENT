@@ -420,15 +420,20 @@ function logTokenUsage(usage, cumulative, contextWindow) {
  * @returns {Promise<object>} The parsed JSON response body.
  * @throws {Error} On network failure or non-2xx HTTP responses.
  */
-async function callLlama(messages, config) {
+async function callLlama(messages, config, hooks = {}) {
+  const streamingEnabled = process.env.LLAMA_STREAM !== '0' && process.env.LLAMA_STREAM !== 'false';
   const body = {
     model: config.model,
     messages,
     tools: toolSchemas,
     tool_choice: 'auto',
     temperature: 0.2,
-    stream: false,
+    stream: streamingEnabled,
   };
+
+  if (streamingEnabled) {
+    body.stream_options = { include_usage: true };
+  }
 
   let response;
   try {
@@ -451,7 +456,165 @@ async function callLlama(messages, config) {
     );
   }
 
-  return response.json();
+  if (!streamingEnabled) {
+    return response.json();
+  }
+
+  if (!response.body) {
+    return response.json();
+  }
+
+  return readLlamaSseResponse(response.body, hooks);
+}
+
+/**
+ * Consume a llama.cpp SSE stream and reconstruct a chat-completions payload.
+ *
+ * @param {import('node:stream').Readable} body - Response body stream.
+ * @param {object} hooks - Streaming callbacks.
+ * @param {() => void} [hooks.onProgress]
+ * @param {(text: string) => void} [hooks.onContent]
+ * @param {(text: string) => void} [hooks.onReasoning]
+ * @returns {Promise<{choices: Array<{message: object}>, usage: object|undefined}>}
+ */
+async function readLlamaSseResponse(body, hooks = {}) {
+  const assistantMessage = { role: 'assistant', content: '' };
+  const toolCallsByIndex = new Map();
+  let usage;
+  let buffer = '';
+  let eventLines = [];
+  let finished = false;
+
+  const emitProgress = () => {
+    if (hooks.onProgress) {
+      hooks.onProgress();
+    }
+  };
+
+  const mergeToolCall = (toolCall, fallbackIndex) => {
+    const index = Number.isInteger(toolCall?.index) ? toolCall.index : fallbackIndex;
+    const existing = toolCallsByIndex.get(index) || {
+      index,
+      id: undefined,
+      type: undefined,
+      function: { name: '', arguments: '' },
+    };
+
+    if (toolCall?.id) {
+      existing.id = toolCall.id;
+    }
+    if (toolCall?.type) {
+      existing.type = toolCall.type;
+    }
+    if (!existing.function) {
+      existing.function = { name: '', arguments: '' };
+    }
+    if (toolCall?.function?.name) {
+      existing.function.name = toolCall.function.name;
+    }
+    if (toolCall?.function?.arguments) {
+      existing.function.arguments = `${existing.function.arguments || ''}${toolCall.function.arguments}`;
+    }
+
+    toolCallsByIndex.set(index, existing);
+  };
+
+  const consumeEvent = (data) => {
+    const trimmed = data.trim();
+    if (!trimmed || trimmed === '[DONE]') {
+      return trimmed === '[DONE]';
+    }
+
+    let payload;
+    try {
+      payload = JSON.parse(trimmed);
+    } catch (err) {
+      throw new Error(`Failed to parse llama.cpp SSE payload: ${err.message}`);
+    }
+
+    if (payload?.usage) {
+      usage = payload.usage;
+    }
+
+    const choices = Array.isArray(payload?.choices) ? payload.choices : [];
+    for (const choice of choices) {
+      const delta = choice?.delta || {};
+      if (typeof delta.reasoning_content === 'string' && delta.reasoning_content.length > 0) {
+        emitProgress();
+        if (hooks.onReasoning) {
+          hooks.onReasoning(delta.reasoning_content);
+        }
+      }
+      if (typeof delta.content === 'string' && delta.content.length > 0) {
+        emitProgress();
+        if (hooks.onContent) {
+          hooks.onContent(delta.content);
+        }
+        assistantMessage.content += delta.content;
+      }
+      if (Array.isArray(delta.tool_calls) && delta.tool_calls.length > 0) {
+        emitProgress();
+        delta.tool_calls.forEach((toolCall, idx) => mergeToolCall(toolCall, idx));
+      }
+    }
+
+    return false;
+  };
+
+  for await (const chunk of body) {
+    if (finished) {
+      break;
+    }
+    buffer += Buffer.isBuffer(chunk) ? chunk.toString('utf8') : String(chunk);
+
+    let newlineIndex;
+    while ((newlineIndex = buffer.indexOf('\n')) !== -1) {
+      const line = buffer.slice(0, newlineIndex).replace(/\r$/, '');
+      buffer = buffer.slice(newlineIndex + 1);
+
+      if (line === '') {
+        for (const eventLine of eventLines) {
+          const done = consumeEvent(eventLine);
+          if (done) {
+            finished = true;
+            break;
+          }
+        }
+        eventLines = [];
+        continue;
+      }
+
+      if (line.startsWith('data:')) {
+        eventLines.push(line.slice(5).replace(/^ /, ''));
+      }
+    }
+  }
+
+  if (buffer.length > 0) {
+    const line = buffer.replace(/\r$/, '');
+    if (line.startsWith('data:')) {
+      eventLines.push(line.slice(5).replace(/^ /, ''));
+    }
+  }
+
+  if (eventLines.length > 0) {
+    for (const eventLine of eventLines) {
+      const done = consumeEvent(eventLine);
+      if (done) {
+        finished = true;
+        break;
+      }
+    }
+  }
+
+  if (toolCallsByIndex.size > 0) {
+    assistantMessage.tool_calls = [...toolCallsByIndex.values()].sort((a, b) => a.index - b.index);
+  }
+
+  return {
+    choices: [{ message: assistantMessage }],
+    usage,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -509,21 +672,83 @@ function parseToolArguments(rawArgs) {
  */
 export async function runTurn(messages, config, cumulative) {
   for (let iteration = 0; iteration < MAX_ITERATIONS_PER_TURN; iteration += 1) {
-    const spinner = ora({
+    const requestSpinner = ora({
       text: chalk.blue('Contacting llama.cpp…'),
       color: 'blue',
     }).start();
 
+    let spinnerActive = true;
+    const stopRequestSpinner = () => {
+      if (!spinnerActive) {
+        return;
+      }
+      requestSpinner.stop();
+      spinnerActive = false;
+    };
+
+    const streamEnabled = process.env.LLAMA_STREAM !== '0' && process.env.LLAMA_STREAM !== 'false';
+    let liveOutputStarted = false;
+    let contentHeaderPrinted = false;
+    let liveOutputWritten = false;
+
+    const startLiveOutput = () => {
+      if (!liveOutputStarted) {
+        stopRequestSpinner();
+        liveOutputStarted = true;
+      }
+    };
+
+    const streamReasoning = (chunk) => {
+      if (!chunk) {
+        return;
+      }
+      startLiveOutput();
+      liveOutputWritten = true;
+      process.stdout.write(chalk.dim(chunk));
+    };
+
+    const streamContent = (chunk) => {
+      if (!chunk) {
+        return;
+      }
+      startLiveOutput();
+      if (!contentHeaderPrinted) {
+        if (liveOutputWritten) {
+          process.stdout.write('\n');
+        }
+        process.stdout.write(chalk.cyan('[THOUGHT] '));
+        contentHeaderPrinted = true;
+      }
+      liveOutputWritten = true;
+      process.stdout.write(chalk.cyan(chunk));
+    };
+
     let data;
     try {
-      data = await callLlama(messages, config);
-      spinner.stop();
+      data = await callLlama(messages, config, streamEnabled
+        ? {
+            onProgress: startLiveOutput,
+            onContent: streamContent,
+            onReasoning: streamReasoning,
+          }
+        : undefined,
+      );
+      stopRequestSpinner();
     } catch (err) {
-      spinner.fail(chalk.red('LLM request failed.'));
+      if (spinnerActive) {
+        requestSpinner.fail(chalk.red('LLM request failed.'));
+        spinnerActive = false;
+      } else {
+        console.log(chalk.red('LLM request failed.'));
+      }
       throw err;
     }
 
-    // --- Token tracking --------------------------------------------------
+    if (liveOutputWritten) {
+      process.stdout.write('\n');
+    }
+
+    // --- Token tracking -------------------------------------------------
     const usage = data.usage;
     if (usage) {
       cumulative.total += usage.total_tokens ?? 0;
@@ -549,13 +774,13 @@ export async function runTurn(messages, config, cumulative) {
     messages.push(storedAssistant);
 
     // Surface any reasoning text the model included.
-    if (assistantMessage.content) {
+    if (!streamEnabled && assistantMessage.content) {
       logThought(assistantMessage.content);
     }
 
     const toolCalls = assistantMessage.tool_calls;
 
-    // --- No tool calls => natural turn boundary --------------------------
+    // --- No tool calls => natural turn boundary ------------------------
     if (!Array.isArray(toolCalls) || toolCalls.length === 0) {
       const content = (assistantMessage.content ?? '').trim();
 
@@ -566,7 +791,7 @@ export async function runTurn(messages, config, cumulative) {
         return { status: 'complete', content: summary };
       }
 
-      // --- Text-format tool call interceptor --------------------------------
+      // --- Text-format tool call interceptor ---------------------------
       // Some local models output tool invocations as ```json {"name":"writeFile",
       // "arguments":{...}} ``` instead of using the native function-calling
       // protocol.  Detect these, dispatch them through the normal tool pipeline,
@@ -603,7 +828,7 @@ export async function runTurn(messages, config, cumulative) {
         continue; // re-enter the agent loop
       }
 
-      // --- Auto-write interceptor -------------------------------------------
+      // --- Auto-write interceptor ------------------------------------
       // Many local models fail to use function-calling and instead output code
       // blocks as plain text.  Detect these, write them to disk automatically,
       // and re-enter the loop so the model sees the files were created.
@@ -646,7 +871,7 @@ export async function runTurn(messages, config, cumulative) {
       return { status: 'awaiting_user', content };
     }
 
-    // --- Execute each requested tool call --------------------------------
+    // --- Execute each requested tool call -----------------------------
     for (const call of toolCalls) {
       const fn = call.function || {};
       const name = fn.name;
